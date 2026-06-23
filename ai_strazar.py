@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
 import nltk
 import yfinance as yf
+import matplotlib.pyplot as plt
+import io
 from flask import Flask
 
 # Postavljanje profesionalnog logiranja
@@ -80,6 +82,17 @@ def inicijaliziraj_bazu():
             status TEXT DEFAULT 'OTVORENO'
         )
     ''')
+    # POVIJEST TRGOVANJA - za pamćenje završenih pozicija
+    izvrsi_upit('''
+        CREATE TABLE IF NOT EXISTS povijest_trgovanja (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vrijeme TEXT,
+            ticker TEXT,
+            kolicina REAL,
+            cijena_prodaje REAL,
+            realizirani_pl REAL
+        )
+    ''')
     # KONFIGURACIJA - za trajno spremanje budžeta
     izvrsi_upit('''
         CREATE TABLE IF NOT EXISTS konfiguracija (
@@ -99,6 +112,71 @@ def get_budzet():
 def update_budzet(iznos):
     izvrsi_upit("UPDATE konfiguracija SET vrijednost = ? WHERE kljuc = 'BUDZET'", (iznos,))
 
+def prodaj_poziciju(ticker, zeljena_kolicina_str="SVE"):
+    pozicije = izvrsi_upit("SELECT id, kolicina, cijena_ulaza FROM pozicije WHERE ticker = ? AND status = 'OTVORENO'", (ticker,), fetchall=True)
+    if not pozicije:
+        return False, f"❌ Nemaš otvorenih pozicija za *{ticker}*."
+        
+    ukupna_kolicina = sum(p[1] for p in pozicije)
+    
+    if zeljena_kolicina_str == "SVE":
+        zeljena_kolicina = ukupna_kolicina
+    else:
+        try:
+            zeljena_kolicina = float(str(zeljena_kolicina_str).replace(',', '.'))
+        except ValueError:
+            return False, "❌ Količina mora biti broj (npr. 0.5) ili SVE."
+            
+    if zeljena_kolicina > ukupna_kolicina:
+        return False, f"❌ Nemaš toliko dionica. Tvoja ukupna količina za {ticker} je {ukupna_kolicina:.4f} kom."
+        
+    tren_cijena = dohvati_live_cijanu(ticker)
+    if tren_cijena == 0:
+        return False, f"❌ Trenutno ne mogu dohvatiti live cijenu za {ticker}. Pokušaj kasnije."
+        
+    preostalo_za_prodati = zeljena_kolicina
+    zarada_od_prodaje = 0
+    ostvareni_pl = 0
+    
+    for poz in pozicije:
+        p_id, p_kol, p_ulaz = poz
+        if preostalo_za_prodati <= 0: break
+            
+        prodajem_iz_ove = min(p_kol, preostalo_za_prodati)
+        vr_prodaje = prodajem_iz_ove * tren_cijena
+        vr_ulaganja = prodajem_iz_ove * p_ulaz
+        
+        zarada_od_prodaje += vr_prodaje
+        ostvareni_pl += (vr_prodaje - vr_ulaganja)
+        
+        nova_kol = p_kol - prodajem_iz_ove
+        if nova_kol <= 0.00001:
+            izvrsi_upit("UPDATE pozicije SET status = 'ZATVORENO', kolicina = 0 WHERE id = ?", (p_id,))
+        else:
+            izvrsi_upit("UPDATE pozicije SET kolicina = ? WHERE id = ?", (nova_kol, p_id))
+            
+        preostalo_za_prodati -= prodajem_iz_ove
+        
+    novi_b = get_budzet() + zarada_od_prodaje
+    update_budzet(novi_b)
+    
+    vrijeme = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    izvrsi_upit("INSERT INTO povijest_trgovanja (vrijeme, ticker, kolicina, cijena_prodaje, realizirani_pl) VALUES (?, ?, ?, ?, ?)", 
+                (vrijeme, ticker, zeljena_kolicina, tren_cijena, ostvareni_pl))
+    
+    emoti = "🟢" if ostvareni_pl >= 0 else "🔴"
+    return True, (
+        f"🤝 *ZATVORENA POZICIJA ({ticker})*\n\n"
+        f"• Prodano komada: {zeljena_kolicina:.4f}\n"
+        f"• Cijena izvršenja: {tren_cijena:.2f} $\n"
+        f"• Vrijednost isplate: {zarada_od_prodaje:.2f} €\n"
+        f"• Uknjižen P/L: {emoti} *{ostvareni_pl:.2f} €*\n\n"
+        f"💳 *Novi budžet:* {novi_b:.2f} €"
+    )
+
+def yap():
+    pass
+
 def zapamti_signal(ticker, cijena, vjerojatnost, tip):
     izvrsi_upit('''
         INSERT INTO signali (vrijeme, ticker, cijena_kod_signala, vjerojatnost_modela, tip_signala)
@@ -114,6 +192,13 @@ def posalji_telegram_poruku(tekst):
         requests.post(url, json={"chat_id": CHAT_ID, "text": tekst, "parse_mode": "Markdown"}, timeout=10)
     except Exception as e: 
         logging.error(f"Telegram greška pri slanju: {e}")
+
+def posalji_sliku_telegram(slika_bajtovi, caption):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    try: 
+        requests.post(url, data={"chat_id": CHAT_ID, "caption": caption, "parse_mode": "Markdown"}, files={"photo": slika_bajtovi}, timeout=15)
+    except Exception as e: 
+        logging.error(f"Telegram greška pri slanju slike: {e}")
 
 def pozadinski_telegram_slusac():
     global aktivan_signal
@@ -158,6 +243,10 @@ def pozadinski_telegram_slusac():
                             poruka = "💼 *VAŠ PORTFELJ (Otvorene pozicije):*\n\n"
                             ukupna_vrijednost = 0
                             ukupni_ulozak = 0
+                            
+                            podaci_za_pie = []
+                            labele_za_pie = []
+                            
                             for poz in pozicije:
                                 p_id, p_ticker, p_kol, p_cijena_ulaza = poz
                                 tren_cijena = dohvati_live_cijanu(p_ticker)
@@ -172,6 +261,10 @@ def pozadinski_telegram_slusac():
                                 ukupni_ulozak += ulog
                                 ukupna_vrijednost += trenutna_vr
                                 
+                                if trenutna_vr > 0:
+                                    podaci_za_pie.append(trenutna_vr)
+                                    labele_za_pie.append(p_ticker)
+                                
                                 emotikon = "🟢" if razlika >= 0 else "🔴"
                                 poruka += f"📦 *{p_ticker}* ({p_kol:.4f} kom)\n"
                                 poruka += f"  • Ulaz: {p_cijena_ulaza:.2f} $ | Trenutno: {tren_cijena:.2f} $\n"
@@ -184,7 +277,21 @@ def pozadinski_telegram_slusac():
                             poruka += f"📊 *Trenutna vrijednost:* {ukupna_vrijednost:.2f} €\n"
                             poruka += f"⚖️ *Ukupni P/L:* {tot_emoti} *{tot_razlika:.2f} €*"
                             
-                            posalji_telegram_poruku(poruka)
+                            if podaci_za_pie:
+                                try:
+                                    plt.figure(figsize=(6, 6))
+                                    plt.pie(podaci_za_pie, labels=labele_za_pie, autopct='%1.1f%%', startangle=140, colors=plt.cm.Paired.colors)
+                                    plt.title("Udio u portfelju (€)")
+                                    buf = io.BytesIO()
+                                    plt.savefig(buf, format='png')
+                                    buf.seek(0)
+                                    plt.close()
+                                    posalji_sliku_telegram(buf, poruka)
+                                except Exception as e:
+                                    logging.error(f"Grafikon error: {e}")
+                                    posalji_telegram_poruku(poruka)
+                            else:
+                                posalji_telegram_poruku(poruka)
 
                     elif tekst_poruke.startswith("/BUDZET"):
                         try:
@@ -193,6 +300,72 @@ def pozadinski_telegram_slusac():
                             posalji_telegram_poruku(f"✅ Proračun trajno ažuriran u bazi na *{novi_iznos:.2f} €*.")
                         except:
                             posalji_telegram_poruku("❌ Krivi format. Napiši npr. `/budzet 1500`.")
+                            
+                    elif tekst_poruke.startswith("PRODAJ ") or tekst_poruke.startswith("/PRODAJ "):
+                        dijelovi = tekst_poruke.split()
+                        if len(dijelovi) < 2:
+                            posalji_telegram_poruku("❌ *Uputa za prodaju:*\nPošalji `prodaj TICKER` za prodaju cijele pozicije (npr. `prodaj AAPL`).\nIli `prodaj TICKER KOLICINA` za djelomičnu (npr. `prodaj AAPL 0.5`).")
+                        else:
+                            p_ticker = dijelovi[1]
+                            z_kol = dijelovi[2] if len(dijelovi) > 2 else "SVE"
+                            uspjeh, txt = prodaj_poziciju(p_ticker, z_kol)
+                            posalji_telegram_poruku(txt)
+                            
+                    elif tekst_poruke == "/PANIC" or tekst_poruke == "/OCISTI_CRVENO":
+                        pozicije = izvrsi_upit("SELECT ticker, kolicina, cijena_ulaza FROM pozicije WHERE status = 'OTVORENO'", fetchall=True)
+                        if not pozicije:
+                            posalji_telegram_poruku("💼 Tvoj portfelj je trenutno prazan. Nema panike!")
+                            continue
+                            
+                        suma_po_tickeru = {}
+                        for p in pozicije:
+                            t = p[0]
+                            k = p[1]
+                            cijena = p[2]
+                            ulog = k * cijena
+                            if t not in suma_po_tickeru: suma_po_tickeru[t] = {"kol": 0, "ulog": 0}
+                            suma_po_tickeru[t]["kol"] += k
+                            suma_po_tickeru[t]["ulog"] += ulog
+                            
+                        prodano_tekst = "🚨 *PANIC BUTTON AKTIVIRAN* 🚨\nZatvorene gubitaške pozicije:\n\n"
+                        barem_jedna = False
+                        
+                        for t, podaci in suma_po_tickeru.items():
+                            tren_cijena = dohvati_live_cijanu(t)
+                            if tren_cijena == 0: continue
+                            
+                            trenutna_vr = podaci["kol"] * tren_cijena
+                            razlika = trenutna_vr - podaci["ulog"]
+                            if razlika < 0:
+                                uspjeh, result_txt = prodaj_poziciju(t, "SVE")
+                                if uspjeh:
+                                    barem_jedna = True
+                                    prodano_tekst += f"🔻 {t}: prodano {podaci['kol']:.4f} kom, gubitak: {razlika:.2f} €\n"
+                        
+                        if barem_jedna:
+                            prodano_tekst += f"\n💳 *Novi budžet:* {get_budzet():.2f} €"
+                            posalji_telegram_poruku(prodano_tekst)
+                        else:
+                            posalji_telegram_poruku("✅ Nema 'crvenih' pozicija (gubitaka) u portfelju.")
+                            
+                    elif tekst_poruke == "/POVIJEST" or tekst_poruke == "/DNEVNIK":
+                        povijest = izvrsi_upit("SELECT vrijeme, ticker, kolicina, cijena_prodaje, realizirani_pl FROM povijest_trgovanja ORDER BY id DESC LIMIT 15", fetchall=True)
+                        if not povijest:
+                            posalji_telegram_poruku("📭 Nema zabilježenih prošlih trgovanja.")
+                        else:
+                            txt = "📓 *ZADNJA TRGOVANJA (15 novijih):*\n\n"
+                            for p in povijest:
+                                datum, ticker, kol, cijena, rpl = p
+                                e = "🟢" if rpl >= 0 else "🔴"
+                                txt += f"• `{datum[:16]}` | {ticker} ({kol:.2f} kom) | PL: {e} {rpl:.2f} €\n"
+                            posalji_telegram_poruku(txt)
+                            
+                    elif tekst_poruke == "/PROFIT":
+                        tekuci_mjesec = datetime.now().strftime("%Y-%m")
+                        povijest = izvrsi_upit("SELECT realizirani_pl FROM povijest_trgovanja WHERE vrijeme LIKE ?", (tekuci_mjesec + "%",), fetchall=True)
+                        ukupni_profit = sum([float(p[0]) for p in povijest]) if povijest else 0.0
+                        e = "🟢" if ukupni_profit >= 0 else "🔴"
+                        posalji_telegram_poruku(f"📊 *Mjesečni P/L ({tekuci_mjesec}):*\n{e} *{ukupni_profit:.2f} €*")
                             
                     # 2. OBRADA SIGNALA KUPNJE (A, B, C)
                     elif tekst_poruke in ["A", "B", "C"]:
@@ -221,237 +394,4 @@ def pozadinski_telegram_slusac():
                                         f"💳 Preostali budžet: {budzet_stanje - ulog:.2f} €"
                                     )
                                 else:
-                                    posalji_telegram_poruku(f"❌ *Odbijeno!* Nemate dovoljno budžeta. (Traženo: {ulog:.2f} €, Raspoloživo: {budzet_stanje:.2f} €)")
-                            else:
-                                posalji_telegram_poruku("⏭ *Signal preskočen.* Čekam sljedeću priliku.")
-                            
-                            # Očisti signal bez obzira na ishod (A, B ili C)
-                            aktivan_signal = None
-                        else:
-                            posalji_telegram_poruku("ℹ️ Trenutno nema aktivnog signala na ekranu za odabir.")
-
-        except Exception as e:
-            time.sleep(2)  
-
-# =====================================================================
-# ⏰ BURZA VRIJEME
-# =====================================================================
-def je_li_burza_otvorena():
-    sada = datetime.now()
-    if sada.weekday() >= 5: return False
-    pocetak = datetime.strptime("15:30", "%H:%M").time()
-    kraj = datetime.strptime("22:00", "%H:%M").time()
-    return pocetak <= sada.time() <= kraj
-
-# =====================================================================
-# 📈 PAMETNI MODULI ZA BURZU (YFinance + Alpha Vantage)
-# =====================================================================
-def dohvati_live_cijanu(ticker):
-    try:
-        dionica = yf.Ticker(ticker)
-        trenutna_cijena = dionica.info.get('regularMarketPrice') or dionica.info.get('currentPrice')
-        
-        if not trenutna_cijena:
-            hist = dionica.history(period="1d")
-            if not hist.empty:
-                trenutna_cijena = hist['Close'].iloc[-1]
-                
-        return float(trenutna_cijena) if trenutna_cijena else 0.0
-    except: return 0.0
-
-def dohvati_prosjek_5_dana(ticker):
-    sada = datetime.now()
-    if ticker in cache_prosjeka:
-        vrijeme_kesa, vrijednost = cache_prosjeka[ticker]
-        if sada - vrijeme_kesa < timedelta(hours=12): return vrijednost
-    try:
-        hist = yf.Ticker(ticker).history(period="5d")
-        if not hist.empty:
-            prosjek = hist['Close'].mean()
-            if prosjek > 0: cache_prosjeka[ticker] = (sada, float(prosjek))
-            return float(prosjek)
-        return 0.0
-    except: return cache_prosjeka.get(ticker, (0, 0.0))[1]
-
-def provjeri_anti_hype_stit(ticker):
-    sada = datetime.now()
-    if ticker in cache_stita:
-        vrijeme_kesa, vrijednost = cache_stita[ticker]
-        if sada - vrijeme_kesa < timedelta(hours=24): return vrijednost
-    try:
-        info = yf.Ticker(ticker).info
-        margin = info.get("profitMargins", 0)
-        debt_eq = info.get("debtToEquity", 0)
-        debt_eq_norm = debt_eq / 100.0 if debt_eq and debt_eq > 10 else debt_eq
-        
-        ishod = not (margin and margin < -0.20 or (debt_eq_norm and debt_eq_norm > 3.0))
-        cache_stita[ticker] = (sada, ishod)
-        return ishod
-    except: return cache_stita.get(ticker, (0, True))[1]
-
-def analiziraj_sentiment_vijesti(ticker):
-    sada = datetime.now()
-    if ticker in cache_sentiment:
-        vrijeme_kesa, vrijednost = cache_sentiment[ticker]
-        if sada - vrijeme_kesa < timedelta(minutes=15): return vrijednost
-    try:
-        url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={ticker}&apikey={ALPHA_VANTAGE_KEY}"
-        res = requests.get(url, timeout=10).json()
-        feed = res.get("feed", [])
-        if not feed: return 0.0
-        sia = SentimentIntensityAnalyzer()
-        ukupni_score = sum([sia.polarity_scores(a.get("title", ""))["compound"] for a in feed[:5]])
-        prosjek_sentiment = ukupni_score / min(len(feed), 5)
-        cache_sentiment[ticker] = (sada, prosjek_sentiment)
-        return prosjek_sentiment
-    except: return cache_sentiment.get(ticker, (0, 0.0))[1]
-
-def dohvati_faktor_ucenja(ticker):
-    redovi = izvrsi_upit(
-        "SELECT status_provjere FROM signali WHERE ticker = ? AND status_provjere IN ('PROMAŠAJ', 'POGODAK') ORDER BY id DESC LIMIT 5",
-        (ticker,), fetchall=True
-    )
-    zadnji_rezultati = [red[0] for red in redovi]
-    return max(0.70, 1.0 - (zadnji_rezultati.count("PROMAŠAJ") * 0.05))
-
-def analiziraj_stare_signale_i_uci():
-    redovi = izvrsi_upit("SELECT id, vrijeme, ticker, cijena_kod_signala, tip_signala FROM signali WHERE status_provjere = 'CEKANJE'", fetchall=True)
-    if not redovi: return
-    
-    for red in redovi:
-        id_signala, vrijeme_str, ticker, cijena_tada, tip = red
-        if datetime.now() > datetime.strptime(vrijeme_str, "%Y-%m-%d %H:%M:%S") + timedelta(days=3):
-            trenutna_cijena = dohvati_live_cijanu(ticker)
-            if trenutna_cijena == 0: continue
-            ishod = "POGODAK" if (tip == "KUPNJA" and trenutna_cijena > cijena_tada) or (tip == "PANIKA" and trenutna_cijena < cijena_tada) else "PROMAŠAJ"
-            izvrsi_upit("UPDATE signali SET status_provjere = ? WHERE id = ?", (ishod, id_signala))
-
-def izracunaj_kelly_ulog(vjerojatnost, trenutni_budzet):
-    kelly_postotak = vjerojatnost - (1 - vjerojatnost)
-    if kelly_postotak <= 0: return 0.0, 0.0
-    konacni_postotak = min(kelly_postotak, 0.20) # max 20% limit
-    return konacni_postotak, trenutni_budzet * konacni_postotak
-
-# =====================================================================
-# 🌐 WEB SERVER (Za UptimeRobot & Render)
-# =====================================================================
-app = Flask(__name__)
-
-@app.route('/')
-def home():
-    return "AI Stražar je online i radi bez prestanka! 📈"
-
-def run_flask():
-    # Render.com dinamično dodjeljuje PORT
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port)
-
-# =====================================================================
-# 🚀 GLAVNI POGON
-# =====================================================================
-if __name__ == "__main__":
-    inicijaliziraj_bazu()
-    
-    # NOVO: Pokretanje Flask web servera za Render.com
-    flask_nit = threading.Thread(target=run_flask, daemon=True)
-    flask_nit.start()
-    
-    telegram_nit = threading.Thread(target=pozadinski_telegram_slusac, daemon=True)
-    telegram_nit.start()
-    
-    logging.info("Glavni pogon za burzu upaljen.")
-    posalji_telegram_poruku("🤖 *AI Stražar v6.0 (Full Interactivity) je online!*\n\nSustav obogaćen bazom za pozicije i budžet.\nKada primite signal, odgovorite na Telegram poruku sa *A*, *B* ili *C*.")
-    
-    memorija_stanja = {dionica: "NEUTRALNO" for dionica in PORTFELJ}
-    brojac_krugova = 0
-    
-    while True:
-        brojac_krugova += 1
-        
-        if not je_li_burza_otvorena():
-            logging.info("Burza zatvorena. Sljedeća provjera za 30 min.")
-            time.sleep(1800)
-            continue
-            
-        if brojac_krugova % 50 == 0:
-            try: analiziraj_stare_signale_i_uci()
-            except Exception as e: logging.error(f"Učenje greška: {e}")
-            
-        for dionica in PORTFELJ:
-            
-            # SIGURNOSNI MEHANIZAM ČEKANJA ODLUKA KORISNIKA
-            if aktivan_signal:
-                _, _, _, vrijeme_signala = aktivan_signal
-                # Ako korisnik ne odgovori 15 minuta (900 sekundi), automatski poništi signal
-                if time.time() - vrijeme_signala > 900:
-                    posalji_telegram_poruku("⏳ *Signal je istekao!* Predugo se čekalo na odluku korisnika, nastavljam analizu portfelja.")
-                    aktivan_signal = None
-                else:
-                    logging.info("Čekam odluku korisnika (A/B/C) na Telegramu...")
-                    time.sleep(15)
-                    continue  # Preskoči daljnju obradu do odluke
-            
-            cijena = dohvati_live_cijanu(dionica)
-            if cijena == 0: 
-                time.sleep(2)
-                continue
-                
-            prosjek = dohvati_prosjek_5_dana(dionica)
-            if not provjeri_anti_hype_stit(dionica): continue
-            sentiment = analiziraj_sentiment_vijesti(dionica)
-            
-            vjerojatnost = 0.50
-            razlozi = []
-            trenutno_stanje = "NEUTRALNO"
-            
-            if cijena > prosjek and prosjek > 0:
-                vjerojatnost += 0.12
-                razlozi.append("Cijena drži stabilan rast iznad prosjeka.")
-            if sentiment > 0.15:
-                vjerojatnost += 0.13
-                razlozi.append(f"AI sentiment vijesti je pozitivan ({sentiment:+.2f}).")
-                
-            faktor = dohvati_faktor_ucenja(dionica)
-            if faktor < 1.0:
-                vjerojatnost *= faktor
-                razlozi.append(f"⚠️ Pouzdanost smanjena zbog nedavnih grešaka modela (-{int((1-faktor)*100)}%).")
-                
-            if vjerojatnost >= 0.62: trenutno_stanje = "KUPNJA"
-            elif cijena < prosjek and sentiment < -0.20 and prosjek > 0: trenutno_stanje = "PANIKA"
-            
-            if trenutno_stanje != memorija_stanja[dionica]:
-                memorija_stanja[dionica] = trenutno_stanje
-                
-                if trenutno_stanje in ["KUPNJA", "PANIKA"]:
-                    zapamti_signal(dionica, cijena, vjerojatnost, trenutno_stanje)
-                
-                if trenutno_stanje == "KUPNJA":
-                    trenutni_budzet = get_budzet()
-                    postotak, novac = izracunaj_kelly_ulog(vjerojatnost, trenutni_budzet)
-                    
-                    if novac > 0.5: # Minimalni prag da uopće traži kupnju
-                        # POSTAVLJANJE SIGNALA NA ČEKANJE ZA KORISNIKA
-                        aktivan_signal = (dionica, cijena, novac, time.time())
-                        
-                        razlozi_tekst = "\n".join([f"• {r}" for r in razlozi])
-                        poruka = (
-                            f"📈 *AI SIGNAL NA ČEKANJU ({dionica})*\n\n"
-                            f"{razlozi_tekst}\n\n"
-                            f"• Cijena: *{cijena:.2f} $*\n"
-                            f"• Pouzdanost: *{vjerojatnost*100:.0f}%*\n"
-                            f"🧮 *Preporučeni max. ulog:* {novac:.2f} €\n"
-                            f"💳 *Raspoloživo na računu:* {trenutni_budzet:.2f} €\n\n"
-                            f"💡 *Odgovori slovom u chat:*\n"
-                            f"🅰️ *A* - Kupi agresivno (Uloži {novac:.2f} €)\n"
-                            f"🅱️ *B* - Kupi konzervativno (Uloži {novac*0.5:.2f} €)\n"
-                            f"❌ *C* - Preskoči priliku"
-                        )
-                        posalji_telegram_poruku(poruka)
-                        break  # Prekini trenutnu for-petlju zbog čekanja odluke
-                        
-                elif trenutno_stanje == "PANIKA":
-                    posalji_telegram_poruku(f"🚨 *ALARM ZA PRODAJU ({dionica}):* Cijena pada na *{cijena:.2f} $*. Trend i vijesti su loši!")
-            
-            time.sleep(15)  # 2. Prijedlog - Bitno je ostaviti 15s pauze unutar for-petlje kako bi se izbjegao "429 Too Many Requests" IP blok od strane Yahoo API-ja
-            
-        time.sleep(10) # Manja pauza prije sljedećeg portfeljnog ciklusa
+                                    posalji_telegram_poruku(f"❌ *Odbijeno!* Nemate dovoljno budžeta. (Traženo: {ulog:.2f} €, Raspoloživo: {budzet_stanje:.2f} €)"
